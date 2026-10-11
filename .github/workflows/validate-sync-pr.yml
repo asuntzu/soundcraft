@@ -1,0 +1,65 @@
+name: Validate sync PR
+
+# Alienated: read-only flags on upstream-update PRs. No secrets, no checkout, no upstream code is run.
+# It only reads the PR file list through the API and posts one comment. It never blocks or fixes anything.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  flag-changes:
+    if: github.event.pull_request.head.ref == 'upstream-sync' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Flag license, workflow, lockfile and secret-pattern changes
+        shell: bash
+        run: |
+          set -uo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate | jq -s 'add // []' > all.json
+          TOTAL="$(jq length all.json)"
+          LIC="$(jq -r '.[].filename | select(test("(^|/)(LICENSE|LICENCE|COPYING|NOTICE|ATTRIBUTION)[^/]*$"; "i"))' all.json)"
+          WF="$(jq -r '.[].filename | select(startswith(".github/workflows/") or startswith(".github/actions/"))' all.json)"
+          LOCK="$(jq -r '.[].filename | select(test("(^|/)(Cargo\\.lock|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|poetry\\.lock|Gemfile\\.lock)$"))' all.json)"
+          SENS="$(jq -r '.[].filename | select(test("(^|/)(\\.env[^/]*|[^/]*\\.(pem|key|p12|pfx)|id_rsa[^/]*)$") or startswith("secrets/"))' all.json)"
+          HITS="$(jq -r '.[] | select(.patch != null) | .filename as $f | .patch | split("\n")[] | select(startswith("+") and (startswith("+++")|not)) | select(test("AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}")) | $f' all.json | sort -u)"
+          UNSCANNED="$(jq '[.[] | select(.patch == null)] | length' all.json)"
+
+          section() { # title, list, ok-text
+            if [ -n "$2" ]; then printf '**FLAG: %s**\n' "$1"; printf '%s\n' "$2" | sed 's/^/- `/; s/$/`/' | head -25; else printf 'OK: %s\n' "$3"; fi
+            echo
+          }
+          {
+            echo '<!-- sync-validate -->'
+            echo '### Upstream sync checks (informational, nothing is blocked or fixed)'
+            echo
+            echo "Files in this update: $TOTAL. These checks read file names and diffs only. No tests were run."
+            echo
+            section 'License or notice files changed. Re-read terms before merging.' "$LIC" 'no license or notice file changes'
+            section 'Upstream workflow files changed. Review before enabling or merging.' "$WF" 'no workflow file changes'
+            section 'Dependency lockfiles changed.' "$LOCK" 'no lockfile changes'
+            section 'Sensitive-looking file names added or changed.' "$SENS" 'no sensitive-looking file names'
+            section 'Added lines match common secret patterns (basic scan, not exhaustive).' "$HITS" 'no common secret patterns in added lines'
+            echo "Not scanned (binary or too large for a diff): $UNSCANNED file(s)."
+            [ "$TOTAL" -ge 3000 ] && echo "GitHub lists at most 3000 files per PR, so this list may be incomplete."
+            echo
+            echo 'Merging means "code is current". It does not mean tested or production-ready.'
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          CID="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq '.[] | select(.body | contains("<!-- sync-validate -->")) | .id' | head -1)"
+          if [ -n "$CID" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$CID" -F body=@comment.md >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md >/dev/null
+          fi
+          exit 0
