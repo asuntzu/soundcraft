@@ -1,0 +1,130 @@
+name: Sync upstream
+
+# Alienated: mirrors the upstream default branch into `upstream-sync` (fast-forward only),
+# opens or updates one PR into `main`, and refreshes the "Sync Status" issue.
+# It never merges into main, never force-pushes, and never builds or runs upstream code.
+# No third-party actions are used, so there is nothing to pin: only the preinstalled gh CLI.
+
+on:
+  schedule:
+    - cron: '35 5 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      UPSTREAM: storytold/soundcraft
+      WORK_BRANCH: main
+      SYNC_BRANCH: upstream-sync
+      # SYNC_TOKEN is optional: a fine-grained token limited to this repo (contents, pull requests,
+      # issues, workflows: write). Needed only when upstream changes touch .github/workflows.
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+    steps:
+      - name: Sync branch, pull request and status issue
+        shell: bash
+        run: |
+          set -uo pipefail
+          REPO="$GITHUB_REPOSITORY"
+          OWNER="${REPO%%/*}"
+          NOW="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          RESULT="success"; DETAIL=""; NEW="no"; CONFLICT="no"; PR_LINE="none open"
+
+          sync_branch() {
+            local up_branch up_sha cur_sha rel status ahead out
+            up_branch="$(gh api "repos/$UPSTREAM" --jq .default_branch)" || { DETAIL="Cannot read upstream repository."; return 1; }
+            up_sha="$(gh api "repos/$UPSTREAM/commits/$up_branch" --jq .sha)" || { DETAIL="Cannot read upstream head commit."; return 1; }
+            cur_sha="$(gh api "repos/$REPO/git/ref/heads/$SYNC_BRANCH" --jq .object.sha)" || { DETAIL="Branch $SYNC_BRANCH is missing."; return 1; }
+            if [ "$up_sha" = "$cur_sha" ]; then DETAIL="Already up to date with upstream."; return 0; fi
+            rel="$(gh api "repos/$REPO/compare/$cur_sha...$up_sha" --jq '.status + " " + (.ahead_by|tostring)')" || { DETAIL="Cannot compare $SYNC_BRANCH with upstream."; return 1; }
+            status="${rel%% *}"; ahead="${rel##* }"
+            if [ "$status" != "ahead" ]; then
+              CONFLICT="yes"
+              DETAIL="Upstream is not a clean fast-forward of $SYNC_BRANCH (status: $status), possibly rewritten history. Nothing was changed."
+              return 1
+            fi
+            if ! out="$(gh api -X PATCH "repos/$REPO/git/refs/heads/$SYNC_BRANCH" -f sha="$up_sha" -F force=false 2>&1)"; then
+              DETAIL="Fast-forward was refused (often because upstream changed .github/workflows and the token lacks workflow permission; add a SYNC_TOKEN secret). GitHub said: ${out:0:300}"
+              return 1
+            fi
+            NEW="yes"; DETAIL="Fast-forwarded $SYNC_BRANCH by $ahead commit(s)."
+            return 0
+          }
+
+          pr_step() {
+            local pending existing n state out
+            pending="$(gh api "repos/$REPO/compare/$WORK_BRANCH...$SYNC_BRANCH" --jq .ahead_by)" || { DETAIL="$DETAIL Cannot compare with $WORK_BRANCH."; return 1; }
+            existing="$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$SYNC_BRANCH&base=$WORK_BRANCH" --jq '.[0].number // empty')"
+            if [ "$pending" = "0" ]; then
+              if [ -n "$existing" ]; then PR_LINE="#$existing open (no pending commits; safe to close)"; else PR_LINE="none: $WORK_BRANCH already contains upstream"; fi
+              return 0
+            fi
+            if [ -z "$existing" ]; then
+              if ! out="$(gh api -X POST "repos/$REPO/pulls" \
+                  -f title="Upstream update ($pending commit(s)) - review before merging" \
+                  -f head="$SYNC_BRANCH" -f base="$WORK_BRANCH" \
+                  -f body="Automated by the Sync upstream workflow. Review the validation comment, then merge or close. Nothing here is deployed, and a merge is NOT a production-readiness decision." 2>&1)"; then
+                DETAIL="$DETAIL Could not open PR (enable 'Allow GitHub Actions to create pull requests' or add SYNC_TOKEN): ${out:0:200}"
+                return 1
+              fi
+              existing="$(echo "$out" | jq -r .number)"
+              gh api -X POST "repos/$REPO/issues/$existing/labels" -f 'labels[]=upstream-update' >/dev/null 2>&1 || true
+            fi
+            sleep 8
+            state="$(gh api "repos/$REPO/pulls/$existing" --jq .mergeable_state 2>/dev/null || echo unknown)"
+            if [ "$state" = "dirty" ]; then CONFLICT="yes"; PR_LINE="#$existing awaiting review, HAS CONFLICTS with $WORK_BRANCH"; else PR_LINE="#$existing awaiting review (merge state: $state)"; fi
+            return 0
+          }
+
+          sync_branch || RESULT="failed"
+          if [ "$RESULT" = "success" ]; then pr_step || RESULT="failed"; fi
+
+          PROTECTED="$(gh api "repos/$REPO/branches/$WORK_BRANCH" --jq .protected 2>/dev/null || echo unknown)"
+          ISSUE="$(gh api "repos/$REPO/issues?labels=sync-status&state=open&per_page=1" --jq '.[0].number // empty' 2>/dev/null || true)"
+          PREV=""
+          if [ -n "$ISSUE" ]; then PREV="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body | sed -n 's/^- Last successful sync: //p' | head -1)"; fi
+          if [ "$RESULT" = "success" ]; then LAST_OK="$NOW"; else LAST_OK="${PREV:-never}"; fi
+
+          BODY="$(cat <<EOF
+          Upstream: https://github.com/$UPSTREAM  (working branch: $WORK_BRANCH, mirror branch: $SYNC_BRANCH)
+
+          - Last sync attempt: $NOW
+          - Last successful sync: $LAST_OK
+          - New upstream commits found this run: $NEW
+          - Sync result: $RESULT
+          - Conflicts or errors: $CONFLICT conflict; $DETAIL
+          - Pull request awaiting review: $PR_LINE
+          - $WORK_BRANCH branch protected: $PROTECTED
+
+          Synced is not tested and not production-ready. Production readiness is decided only in the ALIENATED Storytold Evaluation & Integration Register.
+          Updated automatically by the "Sync upstream" workflow. Run it manually from the Actions tab.
+          EOF
+          )"
+          BODY="$(printf '%s\n' "$BODY" | sed 's/^          //')"
+
+          if [ -z "$ISSUE" ]; then
+            ISSUE="$(gh api -X POST "repos/$REPO/issues" -f title="Sync Status" -f body="$BODY" -f 'labels[]=sync-status' --jq .number 2>/dev/null || true)"
+          else
+            gh api -X PATCH "repos/$REPO/issues/$ISSUE" -f body="$BODY" >/dev/null 2>&1 || true
+          fi
+          if [ -n "$ISSUE" ]; then
+            if [ "$RESULT" = "failed" ]; then
+              gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f 'labels[]=sync-failed' >/dev/null 2>&1 || true
+            else
+              gh api -X DELETE "repos/$REPO/issues/$ISSUE/labels/sync-failed" >/dev/null 2>&1 || true
+            fi
+          fi
+
+          { echo "## Sync upstream: $RESULT"; echo; echo "$BODY"; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$RESULT" = "success" ] || exit 1
