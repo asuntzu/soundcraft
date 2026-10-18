@@ -63,7 +63,7 @@ jobs:
           }
 
           pr_step() {
-            local pending existing n state out
+            local pending existing state out
             pending="$(gh api "repos/$REPO/compare/$WORK_BRANCH...$SYNC_BRANCH" --jq .ahead_by)" || { DETAIL="$DETAIL Cannot compare with $WORK_BRANCH."; return 1; }
             existing="$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$SYNC_BRANCH&base=$WORK_BRANCH" --jq '.[0].number // empty')"
             if [ "$pending" = "0" ]; then
