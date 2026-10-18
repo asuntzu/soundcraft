@@ -31,9 +31,13 @@ jobs:
           WF="$(jq -r '.[].filename | select(startswith(".github/workflows/") or startswith(".github/actions/"))' all.json)"
           LOCK="$(jq -r '.[].filename | select(test("(^|/)(Cargo\\.lock|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|poetry\\.lock|Gemfile\\.lock)$"))' all.json)"
           SENS="$(jq -r '.[].filename | select(test("(^|/)(\\.env[^/]*|[^/]*\\.(pem|key|p12|pfx)|id_rsa[^/]*)$") or startswith("secrets/"))' all.json)"
+          # jq variables must stay literal for jq to interpret them.
+          # shellcheck disable=SC2016
           HITS="$(jq -r '.[] | select(.patch != null) | .filename as $f | .patch | split("\n")[] | select(startswith("+") and (startswith("+++")|not)) | select(test("AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}")) | $f' all.json | sort -u)"
           UNSCANNED="$(jq '[.[] | select(.patch == null)] | length' all.json)"
 
+          # Markdown backticks in the sed expression are intentional literals.
+          # shellcheck disable=SC2016
           section() { # title, list, ok-text
             if [ -n "$2" ]; then printf '**FLAG: %s**\n' "$1"; printf '%s\n' "$2" | sed 's/^/- `/; s/$/`/' | head -25; else printf 'OK: %s\n' "$3"; fi
             echo
