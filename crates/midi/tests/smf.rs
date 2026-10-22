@@ -92,6 +92,24 @@ fn round_trip() {
 }
 
 #[test]
+fn first_track_name_wins_and_ignored_meta_preserves_following_notes() {
+    let meta = |kind, data: &[u8]| [vec![0, 0xFF, kind], vlq(data.len() as u32), data.to_vec()].concat();
+    for first in [&b"First"[..], &b""[..], &[0xFF][..]] {
+        let body = [
+            meta(0x03, first),
+            meta(0x03, b"Second"),
+            meta(0x7F, &[0x03, 0xFF, 0x2F]), // Unhandled metadata must remain ignored.
+            vec![0, 0x90, 60, 100, 16, 0x80, 60, 64, 0, 0xFF, 0x2F, 0],
+        ]
+        .concat();
+        let smf = read_smf(&file(0, 960, &[body])).unwrap();
+        assert_eq!(smf.tracks.len(), 1);
+        assert_eq!(smf.tracks[0].name, String::from_utf8_lossy(first));
+        assert_eq!(smf.tracks[0].sequence.notes, vec![note(60, 0, 16)]);
+    }
+}
+
+#[test]
 fn write_rejects_bad_values() {
     let bad_tempo = Smf { tempos: vec![(0, 0.0)], ..Default::default() };
     assert!(write_smf(&bad_tempo).is_err());
@@ -312,5 +330,23 @@ proptest! {
         a.sort();
         b.sort();
         prop_assert_eq!(a, b);
+    }
+}
+
+/// #472: out-of-range pitches, release velocities and controller numbers clamp to 127 instead of
+/// wrapping into other notes and controllers (128 & 0x7F would be 0).
+#[test]
+fn writer_clamps_out_of_range_data_bytes() {
+    for raw in [127u8, 128, 255] {
+        let mut seq = Sequence::default();
+        seq.notes.push(Note { pitch: raw, velocity: 100, release_velocity: raw, channel: 0, start: 0, length: 960 });
+        seq.ctrls.push(CtrlEvent { tick: 0, channel: 0, kind: CtrlKind::Cc(raw), value: 64 });
+        seq.ctrls.push(CtrlEvent { tick: 0, channel: 0, kind: CtrlKind::PolyPressure(raw), value: 64 });
+        let smf = Smf { tracks: vec![SmfTrack { name: String::new(), sequence: seq }], ..Smf::default() };
+        let back = read_smf(&write_smf(&smf).unwrap()).unwrap();
+        let s = &back.tracks.last().unwrap().sequence;
+        assert_eq!((s.notes[0].pitch, s.notes[0].release_velocity), (127, 127), "input {raw}");
+        let kinds: Vec<CtrlKind> = s.ctrls.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&CtrlKind::Cc(127)) && kinds.contains(&CtrlKind::PolyPressure(127)), "input {raw}: {kinds:?}");
     }
 }

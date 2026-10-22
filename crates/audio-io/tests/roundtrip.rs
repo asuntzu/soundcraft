@@ -1,5 +1,5 @@
 use soundcraft_audio_io::{
-    AudioBuffer, BitDepth, BwfInfo, EncodeOptions, FileFormat, SampleFormat, decode, detect_format, encode, encode_wav_rf64, probe,
+    AudioBuffer, BitDepth, BwfInfo, EncodeOptions, FileFormat, SampleFormat, decode, detect_format, encode, encode_wav_rf64, probe, wav_float_header,
 };
 
 fn sine(sr: u32, channels: usize, frames: usize) -> AudioBuffer {
@@ -267,4 +267,52 @@ fn multichannel_wav_speaker_masks() {
     let o16 = EncodeOptions { bit_depth: BitDepth::Int16, ..opts };
     let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf(2), &o16, 0x3).unwrap();
     assert_eq!(soundcraft_audio_io::wav_channel_mask(&bytes), None);
+}
+
+#[test]
+fn float_wav_header_is_rewritten_in_place_as_the_file_grows() {
+    let take = sine(48_000, 2, 1_000);
+    let mut file = wav_float_header(2, 48_000, 0).unwrap();
+    let len = file.len();
+    file.extend(take.interleaved().iter().flat_map(|s| s.to_le_bytes()));
+    assert_eq!(decode(&file, None).unwrap().1.frames(), 1_000);
+    file[..len].copy_from_slice(&wav_float_header(2, 48_000, 600).unwrap());
+    assert_eq!(decode(&file, None).unwrap().1.frames(), 600);
+    file[..len].copy_from_slice(&wav_float_header(2, 48_000, 1_000).unwrap());
+    assert_eq!(file, encode(&take, &EncodeOptions { bit_depth: BitDepth::Float32, ..EncodeOptions::default() }).unwrap());
+    let big = wav_float_header(2, 48_000, 600_000_000).unwrap();
+    assert_eq!((&big[..4], big.len()), (&b"RF64"[..], len));
+    assert!(wav_float_header(0, 48_000, 0).is_err());
+}
+
+#[test]
+fn zero_frame_flac_round_trips_like_wav_and_aiff() {
+    for format in [FileFormat::Wav, FileFormat::Aiff, FileFormat::Flac] {
+        for depth in [BitDepth::Int16, BitDepth::Int24] {
+            for channels in [1, 2] {
+                let opts = EncodeOptions { format, bit_depth: depth, ..EncodeOptions::default() };
+                let bytes = encode(&AudioBuffer::new(48_000, channels, 0), &opts).unwrap();
+                let info = probe(&bytes, None).unwrap();
+                assert_eq!((info.format, info.sample_format, info.sample_rate, info.frames), (format, expected_sf(depth), 48_000, 0));
+                assert_eq!(usize::from(info.channels), channels);
+                let (info, buf) = decode(&bytes, None).unwrap();
+                assert_eq!((info.frames, buf.frames(), buf.num_channels()), (0, 0, channels));
+            }
+        }
+    }
+}
+
+#[test]
+fn flac_claiming_frames_but_holding_none_still_errors() {
+    let opts = EncodeOptions { format: FileFormat::Flac, bit_depth: BitDepth::Int16, ..EncodeOptions::default() };
+    let mut bytes = encode(&AudioBuffer::new(48_000, 2, 0), &opts).unwrap();
+    bytes[25] = 1; // STREAMINFO total samples (low byte of the 36-bit field) = 1
+    assert!(decode(&bytes, None).is_err());
+}
+
+#[test]
+fn float_wav_header_rejects_a_frame_count_whose_total_size_overflows() {
+    // 4 bytes per frame: the data length fits in u64, but adding the header to it does not.
+    let frames = u64::MAX / 4;
+    assert!(matches!(wav_float_header(1, 48_000, frames), Err(soundcraft_audio_io::AudioError::TooLarge(_))));
 }
